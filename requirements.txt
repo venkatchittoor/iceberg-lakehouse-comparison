@@ -1,0 +1,5 @@
+pyspark==3.5.0
+pyiceberg[pyarrow,pandas,duckdb]>=0.6.0
+faker
+tabulate
+python-dotenv
