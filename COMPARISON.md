@@ -424,6 +424,76 @@ Delta's MERGE performance. The choice today is less about features and more abou
 
 ---
 
+## 11. Metadata Architecture
+
+Iceberg's 5-level hierarchy is what makes all its advanced features possible:
+
+```
+Catalog
+  └── Snapshot  (v1.metadata.json, v2.metadata.json …)
+        └── Manifest List  (snap-<id>-<uuid>.avro)
+              └── Manifest Files  (<uuid>-m0.avro …)
+                    └── Parquet Data Files
+```
+
+Each level is immutable once written. A completed write creates a new Snapshot pointer; all lower
+levels are reused or newly appended, never modified. This absolute immutability is the foundation
+of time travel, schema evolution, and partition evolution — every operation adds new metadata
+rather than patching existing files.
+
+**Old Parquet files are never rewritten by any Iceberg metadata operation.** New files are always
+written alongside old ones. Compaction (`rewrite_data_files`) is an explicit, opt-in operation.
+
+### Which Levels Each Feature Touches
+
+| Feature | Catalog | Snapshot | Manifest List | Manifest Files | Parquet |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Table History | — | ✅ | — | — | — |
+| Time Travel | — | ✅ | ✅ | ✅ | ✅ |
+| Schema Evolution | — | ✅ | — | — | — |
+| Partition Evolution | — | ✅ | ✅ | ✅ | ✅ |
+| Table Metadata | ✅ | ✅ | ✅ | ✅ | — |
+
+**Table History** and **Schema Evolution** touch only the Snapshot layer — they complete in
+milliseconds regardless of table size.
+
+**Time Travel** traverses all levels down to Parquet (read-only). **Partition Evolution** updates
+the Snapshot's partition spec and creates new Manifest Files + Parquet for subsequent writes, but
+never rewrites existing files.
+
+**Table Metadata** queries (`.files`, `.snapshots`, `.manifests`) stop just before Parquet —
+instantaneous even on tables with billions of rows.
+
+### Delta Lake Comparison
+
+Delta Lake uses a simpler two-level structure: `_delta_log/` JSON commits (with inline statistics
+and operation metadata) pointing directly to Parquet data files. Checkpoints compact the log every
+10 commits. This is easier to reason about but provides less separation between metadata and data —
+changing partitioning or column names requires touching data files because partition values and
+column names are embedded in the Parquet file paths and schema.
+
+---
+
+## 12. Running Scorecard
+
+Across the five features demonstrated in `explore_iceberg.py`:
+
+| Feature | Winner | Reason |
+|---|---|---|
+| Table History | **Delta Lake edge** | Richer per-commit metadata out of the box: operation type, user, cluster ID, row-level metrics |
+| Time Travel | **Iceberg edge** | Globally unique content-addressed snapshot IDs vs. local sequential integers — better for multi-engine safety and cross-cloud replication |
+| Schema Evolution | **Iceberg edge** | All operations (add/rename/drop) safe by default; Delta requires opt-in column mapping mode (protocol version upgrade) |
+| Partition Evolution | **Iceberg edge** | Milliseconds (0.23 s observed) vs. full data rewrite; metadata-only by design |
+| Table Metadata | **Tie** | Both expose rich metadata via SQL; Iceberg uses 3-layer Avro manifests, Delta uses `_delta_log` JSON commits |
+
+**Score: Iceberg 3 — Delta Lake 1 — Tie 1** (on this feature set)
+
+Outside this feature set, Delta Lake leads on DLT integrated data quality, Structured Streaming
+maturity, and Unity Catalog governance. The scorecard above is scoped to open table format
+capabilities, not platform capabilities.
+
+---
+
 ## Project Reference
 
 | Artifact | Delta Lake project | Iceberg project (this repo) |

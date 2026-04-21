@@ -94,6 +94,12 @@ After two pipeline runs, the table shows two snapshots with `is_current_ancestor
 `is_current_ancestor = False` on the first snapshot confirms `createOrReplace` cut a new
 lineage root rather than appending — the orphan snapshot remains queryable until expiry.
 
+**Why it matters:** Snapshot history enables compliance auditing, pipeline debugging, governance reviews, and recovery planning. Knowing exactly when each version was created — and whether it's still in the current lineage — answers "what did this table look like at Tuesday's close?" without external logging.
+
+**Delta Lake edge:** Delta's `_delta_log` records richer operation metadata out of the box — operation type, user, cluster ID, and row-level metrics per commit. Iceberg's history is leaner but catalog-portable: the same `.history` query works identically on Spark, Trino, and DuckDB without platform dependency.
+
+**Flow:** This query only touches Snapshot JSON — no Parquet files are read.
+
 ### 2. Time Travel
 Queries the first (orphan) snapshot by ID even after the table was replaced:
 
@@ -103,6 +109,12 @@ spark.sql(f"SELECT * FROM local.silver.orders_enriched VERSION AS OF 86677732883
 
 The underlying Parquet file survives the replacement and is fully readable — zero data loss
 until `expire_snapshots` is explicitly called.
+
+**Why it matters:** Time travel is the safety net for accidental bad writes, audit requirements ("show me Q4 close-of-business data"), and reproducible pipeline debugging.
+
+**Iceberg edge:** Snapshot IDs are globally unique 64-bit integers — not local sequential integers like Delta's version numbers. This matters for multi-table consistency, multi-engine safety (any engine references the same ID), and cross-cloud replication where sequential integers would collide.
+
+**Flow:** Pinning at the Snapshot level automatically constrains all lower levels — Manifest List, Manifest Files, and Parquet data files all follow from the snapshot pointer.
 
 ### 3. Schema Evolution — Zero File Rewrite
 `ALTER TABLE ... ADD COLUMN discount_pct DOUBLE` added a 21st column in milliseconds.
@@ -117,6 +129,12 @@ Columns AFTER  (21): order_item_id, order_id, order_date, … _processed_at, dis
 The column persisted across the subsequent `pipeline.py` run (`createOrReplace`) because
 Iceberg schema metadata lives outside the data files.
 
+**Why it matters:** Adding columns without downtime or file rewrites means schema evolution is safe in production — no migration windows, no cloud cost spikes from rewriting petabyte tables.
+
+**Bottom line:** Both formats support schema evolution. Iceberg makes ALL operations (add/rename/drop) safe by default — columns are tracked by integer ID, not name. Delta Lake requires opt-in column mapping mode (a protocol version upgrade) before rename and drop become non-destructive.
+
+**Flow:** Only the Snapshot JSON is updated — Parquet files are never touched regardless of table size.
+
 ### 4. Partition Evolution
 `SELECT * FROM local.silver.orders_enriched.partitions` returned `_partition: struct<>` —
 the table is currently unpartitioned. In Iceberg, partitioning can be added at any time:
@@ -129,6 +147,12 @@ ALTER TABLE local.silver.orders_enriched ADD PARTITION FIELD order_month;
 New writes use the new spec; existing files keep their original spec. The engine handles
 mixed-spec reads transparently. **This is impossible without a full rewrite in Delta Lake.**
 
+**Why it matters:** Partitioning decisions made at table creation become wrong as data volumes and query patterns change. Re-partitioning a 10 TB table without hours of rewrites and cloud costs is a meaningful operational advantage.
+
+**Iceberg edge:** Partition evolution completes in milliseconds (0.23 seconds observed) vs. a full data rewrite in Delta Lake. The mixed `spec_id` state is a deliberate tradeoff — pay the rewrite cost when you choose to, via off-peak compaction using `rewrite_data_files`.
+
+**Flow:** The only feature that changes multiple metadata levels — but old Parquet files are never rewritten. Only the partition spec in the Snapshot JSON is updated; new writes create new Manifest Files and Parquet under the new spec.
+
 ### 5. Table Metadata
 Three metadata tables exposed as first-class Spark views:
 
@@ -137,6 +161,56 @@ Three metadata tables exposed as first-class Spark views:
 | `.files` | 1 Parquet file, 1,575 records, 43.9 KB |
 | `.snapshots` | 2 snapshots (`append` operations), committed timestamps |
 | `.manifests` | 1 Avro manifest, `added_data_files_count = 1`, zero deletes |
+
+**Why it matters:** Instant table health checks — file counts, snapshot auditing, manifest inspection — all via standard SQL with no special tools. Useful for debugging and capacity planning without leaving your query engine.
+
+**Both formats:** Both Iceberg and Delta Lake expose rich metadata. Iceberg uses a 3-layer architecture above Parquet (Snapshot → Manifest List → Manifest Files → Parquet). Delta Lake uses a simpler `_delta_log` JSON commit structure with inline statistics.
+
+**Flow:** Metadata queries (`.files`, `.snapshots`, `.manifests`) stop at Level 3 — they never touch Parquet data files. Results are instantaneous regardless of table size.
+
+---
+
+## Metadata Architecture
+
+Iceberg uses a 5-level hierarchy separating catalog pointer from actual data:
+
+```
+Catalog
+  └── Snapshot  (v1.metadata.json, v2.metadata.json …)
+        └── Manifest List  (snap-<id>-<uuid>.avro)
+              └── Manifest Files  (<uuid>-m0.avro …)
+                    └── Parquet Data Files
+```
+
+Each level is immutable once written. When a write completes, only the Snapshot pointer updates — lower levels are reused, never modified. This immutability is what makes time travel, schema evolution, and partition evolution metadata-only operations: you always add new metadata, never patch old files.
+
+### Which Levels Each Feature Touches
+
+| Feature | Catalog | Snapshot | Manifest List | Manifest Files | Parquet |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Table History | — | ✅ | — | — | — |
+| Time Travel | — | ✅ | ✅ | ✅ | ✅ |
+| Schema Evolution | — | ✅ | — | — | — |
+| Partition Evolution | — | ✅ | ✅ | ✅ | ✅ |
+| Table Metadata | ✅ | ✅ | ✅ | ✅ | — |
+
+**Key insight:** Table History and Schema Evolution touch only the Snapshot layer — milliseconds regardless of table size. Time Travel and Partition Evolution traverse all levels down to Parquet (read-only for travel; new files only for evolution). Table Metadata queries stop just before Parquet — instantaneous even on tables with billions of rows.
+
+---
+
+## Running Scorecard
+
+| Feature | Winner | Reason |
+|---|---|---|
+| Table History | **Delta Lake edge** | Richer operation metadata out of the box (type, user, cluster, row metrics) |
+| Time Travel | **Iceberg edge** | Globally unique content-addressed snapshot IDs vs. local sequential integers |
+| Schema Evolution | **Iceberg edge** | All ops safe by default; Delta requires opt-in column mapping mode |
+| Partition Evolution | **Iceberg edge** | Milliseconds vs. full data rewrite; metadata-only by design |
+| Table Metadata | **Tie** | Both expose rich metadata; different architecture, equivalent utility |
+
+**Overall: Iceberg 3 — Delta Lake 1 — Tie 1** (on this feature set)
+
+> This scorecard covers the five features in `explore_iceberg.py`. Delta Lake leads on DLT data quality, Structured Streaming maturity, and Unity Catalog governance — dimensions outside this feature set.
 
 ---
 
@@ -175,6 +249,24 @@ Flink but the Spark streaming integration is less mature.
 Fine-grained access control, column-level security, data lineage, and audit logs come
 built-in on Databricks. Getting comparable governance on Iceberg requires assembling
 Nessie / Polaris + a separate access control layer.
+
+### Architecture Insights
+
+**4. Iceberg's metadata architecture is what enables all its advanced features.**
+The 3-layer hierarchy above Parquet (Snapshot → Manifest List → Manifest Files) creates the
+separation that makes time travel, schema evolution, and partition evolution possible without data
+rewrites. Immutability is the foundation — every operation adds new metadata, never modifies
+existing files.
+
+**5. Old Parquet files are never rewritten in any Iceberg operation.**
+Immutability is absolute. Whether you add a column, change the partition spec, or create a new
+snapshot, existing Parquet files are untouched. New files are written alongside old ones;
+compaction (`rewrite_data_files`) is an explicit, opt-in operation.
+
+**6. Partition evolution creates temporary mixed-spec state — by design.**
+After `ADD PARTITION FIELD`, old files retain their original spec while new writes use the new
+spec. The query engine handles this transparently. The mixed state is resolved via off-peak
+compaction when you choose to pay the rewrite cost — not forced on you at partition change time.
 
 ### When to Choose Each
 
